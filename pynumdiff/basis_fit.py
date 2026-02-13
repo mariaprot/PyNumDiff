@@ -5,8 +5,10 @@ from scipy import sparse
 
 from pynumdiff.utils import utility
 
+#maria spectral diff below
 
-def spectraldiff(x, dt, params=None, options=None, high_freq_cutoff=None, even_extension=True, pad_to_zero_dxdt=True):
+def spectraldiff(x, dt, axis=0, params=None, options=None, high_freq_cutoff=None,
+                 even_extension=True, pad_to_zero_dxdt=True):
     """Take a derivative in the Fourier domain, with high frequency attentuation.
 
     :param np.array[float] x: data to differentiate
@@ -18,14 +20,15 @@ def spectraldiff(x, dt, params=None, options=None, high_freq_cutoff=None, even_e
             and 1. Frequencies below this threshold will be kept, and above will be zeroed.
     :param bool even_extension: if True, extend the data with an even extension so signal starts and ends at the same value.
     :param bool pad_to_zero_dxdt: if True, extend the data with extra regions that smoothly force the derivative to
+
             zero before taking FFT.
 
     :return: - **x_hat** (np.array) -- estimated (smoothed) x
              - **dxdt_hat** (np.array) -- estimated derivative of x
     """
-    if params is not None: # Warning to support old interface for a while. Remove these lines along with params in a future release.
+    if params is not None:
         warn("`params` and `options` parameters will be removed in a future version. Use `high_freq_cutoff`, " +
-            "`even_extension`, and `pad_to_zero_dxdt` instead.", DeprecationWarning)
+             "`even_extension`, and `pad_to_zero_dxdt` instead.", DeprecationWarning)
         high_freq_cutoff = params[0] if isinstance(params, list) else params
         if options is not None:
             if 'even_extension' in options: even_extension = options['even_extension']
@@ -33,44 +36,61 @@ def spectraldiff(x, dt, params=None, options=None, high_freq_cutoff=None, even_e
     elif high_freq_cutoff is None:
         raise ValueError("`high_freq_cutoff` must be given.")
 
-    L = len(x)
+    x = np.asarray(x)
+    x0 = np.moveaxis(x, axis, 0) # move time axis to the front of the array
+    # now x0 dims are (# of data points, # of signals)
+    L = x0.shape[0]
 
     # make derivative go to zero at ends (optional)
     if pad_to_zero_dxdt:
         padding = 100
-        pre = getattr(x, 'values', x)[0]*np.ones(padding) # getattr to use .values if x is a pandas Series
-        post = getattr(x, 'values', x)[-1]*np.ones(padding)
-        x = np.hstack((pre, x, post)) # extend the edges
+
+        # just pad first and last values x100
+        first = x0[0:1]               
+        last  = x0[-1:]    
+        pre = np.repeat(first, padding, axis=0)
+        post = np.repeat(last, padding, axis=0)
+
+        xpad = np.concatenate((pre, x0, post), axis=0) # i think hstack won't work with the correct axis
+
         kernel = utility.mean_kernel(padding//2)
-        x_hat = utility.convolutional_smoother(x, kernel) # smooth the edges in
-        x_hat[padding:-padding] = x[padding:-padding] # replace middle with original signal
-        x = x_hat
+        x_hat0 = utility.convolutional_smoother(xpad, kernel, axis=0)
+
+        x_hat0[padding:-padding] = xpad[padding:-padding]
+        x0 = x_hat0
     else:
         padding = 0
 
-    # Do even extension (optional)
+    # Do even extension (optional):
     if even_extension is True:
-        x = np.hstack((x, x[::-1]))
+        x0 = np.concatenate((x0, x0[::-1, ...]), axis=0)
 
     # Form wavenumbers
-    N = len(x)
+    N = x0.shape[0]
     k = np.concatenate((np.arange(N//2 + 1), np.arange(-N//2 + 1, 0)))
-    if N % 2 == 0: k[N//2] = 0 # odd derivatives get the Nyquist element zeroed out
+    if N % 2 == 0: k[N//2] = 0  # odd derivatives get the Nyquist element zeroed out
 
     # Filter to zero out higher wavenumbers
-    discrete_cutoff = int(high_freq_cutoff*N/2) # Nyquist is at N/2 location, and we're cutting off as a fraction of that
+    discrete_cutoff = int(high_freq_cutoff * N / 2) # Nyquist is at N/2 location, and we're cutting off as a fraction of that
+    filt = np.ones_like(k, dtype=float)
     filt = np.ones(k.shape); filt[discrete_cutoff:N-discrete_cutoff] = 0
+    filt = filt.reshape((N,) + (1,)*(x0.ndim-1))
 
-    # Smoothed signal
-    X = np.fft.fft(x)
-    x_hat = np.real(np.fft.ifft(filt * X))
-    x_hat = x_hat[padding:L+padding]
+      # Smoothed signal
+    X = np.fft.fft(x0, axis=0)
+
+    x_hat0 = np.real(np.fft.ifft(filt * X, axis=0))
+    x_hat0 = x_hat0[padding:L+padding]
 
     # Derivative = 90 deg phase shift
-    omega = 2*np.pi/(dt*N) # factor of 2pi/T turns wavenumbers into frequencies in radians/s
-    dxdt_hat = np.real(np.fft.ifft(1j * k * omega * filt * X))
-    dxdt_hat = dxdt_hat[padding:L+padding]
-
+    omega = 2*np.pi/(dt*N)
+    k0 = k.reshape((N,) + (1,)*(x0.ndim-1))
+    dxdt0 = np.real(np.fft.ifft(1j * k0 * omega * filt * X, axis=0))
+    dxdt0 = dxdt0[padding:L+padding]
+    # move back to original axis position
+    x_hat = np.moveaxis(x_hat0, 0, axis)
+    dxdt_hat = np.moveaxis(dxdt0, 0, axis)
+    
     return x_hat, dxdt_hat
 
 
@@ -82,7 +102,7 @@ def rbfdiff(x, dt_or_t, sigma=1, lmbd=0.01):
 
     :param np.array[float] x: data to differentiate
     :param float or array[float] dt_or_t: This function supports variable step size. This parameter is either the constant
-        :math:`\\Delta t` if given as a single float, or data locations if given as an array of same length as :code:`x`.
+    :math:`\\Delta t` if given as a single float, or data locations if given as an array of same length as :code:`x`.
     :param float sigma: controls width of radial basis functions
     :param float lmbd: controls smoothness
 
